@@ -655,7 +655,7 @@ function sheetHtml(){
       fld('workerKey','Ключ доступа',S.settings.workerKey||'','password','autocapitalize="off" autocomplete="off"')+
       '<div class="btns" style="margin-bottom:16px"><button class="chip '+(S.settings.autosend!==false?'g':'')+'" style="padding:10px 14px;font-size:14px" data-act="toggleauto">'+(S.settings.autosend!==false?'Автоотправка включена':'Автоотправка выключена')+'</button><button class="btn ghost" data-act="tgtest">Проверить связь</button></div>'+
       '<button class="btn block" data-act="savesettings" style="margin-bottom:18px">Сохранить настройки</button>'+
-      '<div class="field"><label>Резервная копия</label><div class="btns"><button class="btn ghost" data-act="backup">Скопировать данные</button><button class="btn ghost" data-act="showimport">Восстановить</button></div></div>'+
+      '<div class="field"><label>Резервная копия</label><div class="btns"><button class="btn ghost" data-act="backup">Скопировать данные</button><button class="btn ghost" data-act="showimport">Восстановить</button></div><div class="btns" style="margin-top:8px"><button class="btn" data-act="cloudbackup">Создать облачную копию</button><button class="btn ghost" data-act="cloudrestore">Облачное восстановление</button></div><div class="mute" style="font-size:12px;margin-top:8px">Копия шифруется на устройстве. Пароль не сохраняется. Автокопия — не чаще раза в сутки, при запуске приложения и наличии интернета.</div></div>'+
       (D.imp?'<div class="field"><textarea id="imp" data-k="imp2" placeholder="Вставьте скопированные данные" style="min-height:110px"></textarea><button class="btn block" data-act="doimport" style="margin-top:8px">Загрузить данные</button></div>':'')+
       '<div class="field"><label>Данные</label><button class="btn danger block" data-act="reset">'+(S.demo?'Удалить примеры и начать с нуля':'Стереть все данные')+'</button></div>');
   }
@@ -950,6 +950,68 @@ async function tgPost(text,id){
     throw e;
   }finally{clearTimeout(to)}
 }
+/* ===== Encrypted cloud backups ===== */
+async function cloudRequest(payload){
+  if(!tgReady())throw new Error('Сначала сохраните адрес Worker и ключ доступа в настройках');
+  const res=await fetch(S.settings.workerUrl,{method:'POST',headers:{'Content-Type':'application/json','X-App-Key':S.settings.workerKey},body:JSON.stringify(payload)});
+  let d={};try{d=await res.json()}catch(e){}
+  if(!res.ok||!d.ok)throw new Error(d.error==='unauthorized'?'Неверный ключ доступа':d.error==='origin'?'Worker не разрешён для этого адреса':d.error||('ошибка '+res.status));
+  return d;
+}
+function b64(bytes){let bin='';for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);return btoa(bin)}
+function unb64(s){return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}
+async function backupEncrypt(password){
+  const salt=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12));
+  const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveKey']);
+  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:250000,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['encrypt']);
+  const copy=JSON.parse(JSON.stringify(S));if(copy.settings)copy.settings.workerKey='';
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(JSON.stringify(copy)));
+  return {salt:Array.from(salt,x=>x.toString(16).padStart(2,'0')).join(''),blob:JSON.stringify({v:1,iv:b64(iv),ciphertext:b64(new Uint8Array(ct))})};
+}
+async function backupDecrypt(password,saltHex,blob){
+  const pkg=JSON.parse(blob);if(pkg.v!==1)throw new Error('Неподдерживаемый формат копии');
+  const salt=Uint8Array.from(saltHex.match(/.{2}/g)||[],x=>parseInt(x,16));
+  const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveKey']);
+  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:250000,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(pkg.iv)},key,unb64(pkg.ciphertext));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+async function cloudBackup(password,automatic){
+  if(!password||password.length<8)throw new Error('Пароль должен содержать минимум 8 символов');
+  const enc=await backupEncrypt(password),id='b_'+crypto.randomUUID().replace(/-/g,'');
+  await cloudRequest({action:'backup',id,blob:enc.blob,salt:enc.salt,createdAt:Date.now()});
+  S.settings.lastCloudBackup=Date.now();save();
+  if(!automatic)toast('Зашифрованная копия сохранена в облаке');
+}
+async function cloudBackupAction(){
+  if(!tgReady())return toast('Сначала сохраните Worker и ключ в настройках');
+  const p=prompt('Пароль для шифрования копии (минимум 8 символов). Не используйте пароль от других аккаунтов: его не сохраняем.');if(p===null)return;
+  try{toast('Шифрую и отправляю…');await cloudBackup(p,false)}catch(e){toast('Ошибка: '+e.message)}
+}
+async function cloudRestoreAction(){
+  if(!tgReady())return toast('Сначала сохраните Worker и ключ в настройках');
+  try{
+    const d=await cloudRequest({action:'list_backups'}),items=d.backups||d.items||[];
+    if(!items.length)return toast('Облачных копий пока нет');
+    const sorted=items.slice().sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+    const list=sorted.map((x,i)=>(i+1)+'. '+new Date(x.createdAt||0).toLocaleString('ru-RU')).join('\n');
+    const choice=prompt('Выберите номер копии:\n'+list);if(choice===null)return;
+    const ix=parseInt(choice,10)-1;if(!Number.isInteger(ix)||ix<0||ix>=sorted.length)return toast('Неверный номер');
+    if(!confirm('Восстановить выбранную копию? Текущие данные приложения будут заменены.'))return;
+    const password=prompt('Введите пароль этой резервной копии:');if(password===null)return;
+    const fetched=await cloudRequest({action:'get_backup',id:sorted[ix].id}),rec=fetched.backup||fetched.record||fetched;
+    const restored=await backupDecrypt(password,rec.salt||sorted[ix].salt,rec.blob);
+    if(!restored||!Array.isArray(restored.goals)||!Array.isArray(restored.tasks))throw new Error('Файл не похож на данные LEVEL-UP');
+    const keep={workerUrl:S.settings.workerUrl,workerKey:S.settings.workerKey};
+    S=Object.assign(blank(),restored);S.settings=Object.assign(blank().settings,restored.settings||{},keep);S.goals.forEach(recompute);applyTheme();save();closeSheet();render();toast('Облачная копия восстановлена');
+  }catch(e){toast('Не удалось восстановить: '+e.message)}
+}
+async function dailyCloudBackup(){
+  if(!tgReady()||navigator.onLine===false)return;
+  const last=S.settings.lastCloudBackup||0;if(Date.now()-last<86400000)return;
+  const p=prompt('Пора сделать ежедневную облачную копию LEVEL-UP. Введите пароль шифрования (не сохраняется):');if(p===null)return;
+  try{await cloudBackup(p,true);toast('Ежедневная копия создана')}catch(e){toast('Автокопия не создана: '+e.message)}
+}
 async function sendReport(date,rev,manual){
   const dd=S.days[date];if(!dd)return false;
   const r=dd.reports.find(x=>x.rev===rev);if(!r)return false;
@@ -1004,6 +1066,8 @@ function repBtns(r,idx,first){
     (r.err&&!r.sent?'<div style="font-size:12px;margin-top:8px;color:var(--cr)">Ошибка: '+esc(r.err)+'</div>':'')+copy;
 }
 const TG_A={
+  cloudbackup(){cloudBackupAction()},
+  cloudrestore(){cloudRestoreAction()},
   sendrep(id,v){
     const d=UI.date,r=S.days[d].reports[+v];toast('Отправляю…');
     sendReport(d,r.rev,true).then(ok=>toast(ok?'Отправлено брату':'Не отправлено: '+(r.err||'ошибка')+'. Повторим сами'));
@@ -1213,7 +1277,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&SH)closeSheet()});
 let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{if(UI.tab==='goals')render()},150)});
 
 /* ===== boot ===== */
-S=load();S=Object.assign(blank(),S);S.settings=Object.assign(blank().settings,S.settings||{});S.goals.forEach(recompute);applyTheme();save();render();
+S=load();S=Object.assign(blank(),S);S.settings=Object.assign(blank().settings,S.settings||{});S.goals.forEach(recompute);applyTheme();save();render();setTimeout(dailyCloudBackup,1200);
 </script>
 
 <script>
